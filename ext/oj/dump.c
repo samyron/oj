@@ -899,6 +899,10 @@ void oj_dump_raw_json(VALUE obj, int depth, Out out) {
 void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out out) {
     size_t      size;
     char       *cmap;
+#ifdef HAVE_SIMD_NEON
+    uint8x16x4_t  *cmap_neon = NULL;
+    int           neon_table_size;
+#endif /* HAVE_SIMD_NEON */
     const char *orig                  = str;
     bool        has_hi                = false;
     bool        do_unicode_validation = false;
@@ -930,6 +934,10 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
         long sz;
 
         cmap = rails_xss_friendly_chars;
+#ifdef HAVE_SIMD_NEON
+        cmap_neon = rails_xss_friendly_chars_neon;
+        neon_table_size = 4;
+#endif /* HAVE_NEON_SIMD */
         sz   = rails_xss_friendly_size((uint8_t *)str, cnt);
         if (sz < 0) {
             has_hi = true;
@@ -943,6 +951,10 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
     case RailsEsc: {
         long sz;
         cmap = rails_friendly_chars;
+#ifdef HAVE_SIMD_NEON
+        cmap_neon = rails_friendly_chars_neon;
+        neon_table_size = 2;
+#endif /* HAVE_NEON_SIMD */
         sz   = rails_friendly_size((uint8_t *)str, cnt);
         if (sz < 0) {
             has_hi = true;
@@ -954,7 +966,13 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
         break;
     }
     case JSONEsc:
-    default: cmap = hibit_friendly_chars; size = hibit_friendly_size((uint8_t *)str, cnt);
+    default: 
+        cmap = hibit_friendly_chars; 
+#ifdef HAVE_SIMD_NEON
+        cmap_neon = hibit_friendly_chars_neon;
+        neon_table_size = 2;
+#endif /* HAVE_NEON_SIMD */
+        size = hibit_friendly_size((uint8_t *)str, cnt);
     }
     assure_size(out, size + BUFFER_EXTRA);
     *out->cur++ = '"';
@@ -980,7 +998,39 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
         if (is_sym) {
             *out->cur++ = ':';
         }
-        for (; str < end; str++) {
+#ifdef HAVE_SIMD_NEON
+        const char *chunk_end;
+#endif /* HAVE_SIMD_NEON */
+        loop: for (; str < end; str++) {
+#ifdef HAVE_SIMD_NEON
+            if (cmap_neon != NULL && str + sizeof(uint8x16_t) <= end && chunk_end < str) {
+                chunk_end = NULL;
+
+                uint8x16_t has_some_hibit = vdupq_n_u8(0);
+                uint8x16_t hibit          = vdupq_n_u8(0x80);
+                uint8x16_t chunk          = vld1q_u8((const unsigned char *)str);
+        
+                // Check to see if any of these bytes have the high bit set.
+                has_some_hibit = vorrq_u8(has_some_hibit, vandq_u8(chunk, hibit));
+        
+                uint8x16_t tmp1   = vqtbl4q_u8(cmap_neon[0], chunk);
+                uint8x16_t tmp2   = vqtbl4q_u8(cmap_neon[1], veorq_u8(chunk, vdupq_n_u8(0x40)));
+                uint8x16_t result = vorrq_u8(tmp1, tmp2);
+                if (neon_table_size > 2) {
+                    uint8x16_t tmp3   = vqtbl4q_u8(cmap_neon[2], veorq_u8(chunk, vdupq_n_u8(0x80)));
+                    uint8x16_t tmp4   = vqtbl4q_u8(cmap_neon[3], veorq_u8(chunk, vdupq_n_u8(0xc0)));
+                    result = vorrq_u8(result, vorrq_u8(tmp4, tmp3));
+                }
+                if (vmaxvq_u8(result) == 0) {
+                    APPEND_CHARS(out->cur, str, sizeof(uint8x16_t));
+                    str += sizeof(uint8x16_t);
+                    // Skip the str++ if 'continue' is used.
+                    goto loop;
+                } else {
+                    chunk_end = str + sizeof(uint8x16_t);
+                }
+            }
+#endif /* HAVE_SIMD_NEON */
             switch (cmap[(uint8_t)*str]) {
             case '1':
                 if (do_unicode_validation && check_start <= str) {
