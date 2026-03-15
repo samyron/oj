@@ -222,7 +222,24 @@ inline static OJ_TARGET_SSE42 size_t hibit_friendly_size_sse42(const uint8_t *st
         __m128i tmp   = vector_lookup_sse42(chunk, hibit_friendly_chars_sse42, 8);
         size += _mm_sum_epu8(tmp);
     }
+#ifdef HAVE_FAST_MEMCPYXXX
+   size_t total = 0;
+    if (len - i >= SIMD_MINIMUM_THRESHOLD) {
+        size += (len - i);
+        unsigned char buf[sizeof(__m128i)];
+        memset(buf, ' ', sizeof(buf));
+        fast_memcpy16(buf, str, len - i);
+
+        __m128i chunk = _mm_loadu_si128((__m128i *)buf);
+        __m128i tmp   = vector_lookup_sse42(chunk, hibit_friendly_chars_sse42, 8);
+        size += _mm_sum_epu8(tmp);
+        total = size;
+    } else {
+        total = size + calculate_string_size(str, len - i, hibit_friendly_chars);
+    }
+#else
     size_t total = size + calculate_string_size(str, len - i, hibit_friendly_chars);
+#endif
     return total;
 }
 
@@ -240,7 +257,7 @@ void OJ_TARGET_SSE42 initialize_sse42(void) {
 
 #endif /* HAVE_SIMD_SSE4_2 */
 
-inline static size_t hibit_friendly_size(const uint8_t *str, size_t len) {
+inline static OJ_TARGET_ARCH size_t hibit_friendly_size(const uint8_t *str, size_t len) {
 #ifdef HAVE_SIMD_NEON
     size_t size = 0;
     size_t i    = 0;
@@ -1028,7 +1045,7 @@ typedef struct _sse42_match_result {
 
 static inline OJ_TARGET_SSE42 sse42_match_result
 sse42_update(const char *str, __m128i *cmap_sse42, int sse42_tab_size, bool do_unicode_validation, bool has_hi) {
-    sse42_match_result result = {.has_some_hibit = false, .do_unicode_validation = false};
+    sse42_match_result result = {.has_some_hibit = false, .do_unicode_validation = false, .escape_mask = 0};
 
     __m128i chunk        = _mm_loadu_si128((__m128i *)str);
     __m128i actions      = vector_lookup_sse42(chunk, cmap_sse42, sse42_tab_size);
@@ -1118,7 +1135,7 @@ static inline FORCE_INLINE const char *process_character(char         action,
     return str;
 }
 
-void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out out) {
+OJ_TARGET_ARCH void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out out) {
     size_t size;
     char  *cmap;
 #ifdef HAVE_SIMD_NEON
@@ -1258,8 +1275,6 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
         }
 #endif
 
-#ifdef HAVE_SIMD_NEON
-
 #ifdef HAVE_FAST_MEMCPY
 #define APPEND_CHARS_SMALL(dst, src, length) \
     fast_memcpy16((dst), (src), (length));   \
@@ -1269,6 +1284,8 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
 #define APPEND_CHARS_SMALL(dst, src, length) APPEND_CHARS(dst, str, length);
 #define MEMCPY16 memcpy
 #endif
+
+#ifdef HAVE_SIMD_NEON
 
         if (use_simd) {
             while (str < end) {
@@ -1352,8 +1369,8 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
                         chunk_start = str;
                         chunk_end   = str + sizeof(__m128i);
                     } else if ((end - str) >= SIMD_MINIMUM_THRESHOLD) {
-                        memset(out->cur, 'A', sizeof(__m128i));
-                        memcpy(out->cur, str, (end - str));
+                        memset(out->cur, ' ', sizeof(__m128i));
+                        MEMCPY16(out->cur, str, (end - str));
                         chunk_ptr   = out->cur;
                         chunk_start = str;
                         chunk_end   = end;
@@ -1368,16 +1385,41 @@ void oj_dump_cstr(const char *str, size_t cnt, bool is_sym, bool escape1, Out ou
                     if ((result.do_unicode_validation) || result.needs_escape) {
                         SEARCH_FLUSH;
                         _mm_storeu_si128((__m128i *)matches, result.actions);
-                        while (str < chunk_end) {
-                            long match_index = str - chunk_start;
-                            str              = process_character(matches[match_index],
-                                                    str,
-                                                    end,
-                                                    out,
-                                                    orig,
-                                                    do_unicode_validation,
-                                                    &check_start);
-                            str++;
+                        bool       process_each = result.do_unicode_validation;
+                        if (process_each) {
+                            while (str < chunk_end) {
+                                long match_index = str - chunk_start;
+                                str              = process_character(matches[match_index],
+                                                        str,
+                                                        end,
+                                                        out,
+                                                        orig,
+                                                        do_unicode_validation,
+                                                        &check_start);
+                                str++;
+                            }
+                        } else {
+                            while (result.escape_mask) {
+                                int  esc_pos = OJ_CTZ(result.escape_mask);
+                                long run_len = esc_pos - (str - chunk_start);
+                                if (run_len > 0) {
+                                    APPEND_CHARS_SMALL(out->cur, str, run_len);
+                                    str += run_len;
+                                }
+                                str = process_character(matches[esc_pos],
+                                                        str,
+                                                        end,
+                                                        out,
+                                                        orig,
+                                                        do_unicode_validation,
+                                                        &check_start);
+                                str++;
+                                result.escape_mask &= result.escape_mask - 1;
+                            }
+                            if (str < chunk_end) {
+                                APPEND_CHARS_SMALL(out->cur, str, chunk_end - str);
+                                str = chunk_end;
+                            }
                         }
                         cursor = str;
                         continue;

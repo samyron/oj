@@ -160,11 +160,17 @@ static inline int oj_ctz64_fallback(uint64_t x) {
 
 #if defined(HAVE_SIMD_SSE4_2)
 
+#if defined(__clang__) || defined(__GNUC__)
+#define FORCE_INLINE __attribute__((always_inline))
+#else
+#define FORCE_INLINE
+#endif
+
 #define SIMD_MINIMUM_THRESHOLD 6
 
 extern void initialize_sse42(void);
 
-static inline OJ_TARGET_SSE42 __m128i vector_lookup_sse42(__m128i input, __m128i *lookup_table, int tab_size) {
+static inline FORCE_INLINE OJ_TARGET_SSE42 __m128i vector_lookup_sse42(__m128i input, __m128i *lookup_table, int tab_size) {
     // Extract high 4 bits to determine which 16-byte chunk (0-15)
     __m128i hi_index = _mm_and_si128(_mm_srli_epi32(input, 4), _mm_set1_epi8(0x0F));
 
@@ -214,6 +220,12 @@ inline static void fast_memcpy16(void *dest, const void *src, size_t n) {
         *d = *s;
     }
 }
+#endif
+
+#if defined(HAVE_SIMD_SSE4_2)
+#define OJ_TARGET_ARCH OJ_TARGET_SSE42
+#else
+#define OJ_TARGET_ARCH
 #endif
 
 #endif /* OJ_SIMD_H */
